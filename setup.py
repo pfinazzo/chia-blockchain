@@ -30,6 +30,7 @@ dependencies = [
     "dnspythonchia==2.2.0",  # Query DNS seeds
     "watchdog==2.1.6",  # Filesystem event watching - watches keyring.yaml
     "dnslib==0.9.14",  # dns lib
+    "zstd==1.5.0.4",
 ]
 
 upnp_dependencies = [
