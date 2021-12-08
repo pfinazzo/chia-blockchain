@@ -504,7 +504,7 @@ class TestWeightProof:
     @pytest.mark.asyncio
     async def test_weight_proof_from_database(self):
         connection = await aiosqlite.connect("path to db")
-        block_store: BlockStore = await BlockStore.create(connection)
+        block_store: BlockStore = await BlockStore.create(connection, test_constants)
         blocks = await block_store.get_block_records_in_range(0, 0xFFFFFFFF)
         peak = len(blocks) - 1
         peak_height = blocks[peak].height

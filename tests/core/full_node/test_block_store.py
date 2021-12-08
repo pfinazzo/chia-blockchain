@@ -45,12 +45,12 @@ class TestBlockStore:
 
         # Use a different file for the blockchain
         coin_store_2 = await CoinStore.create(db_wrapper_2)
-        store_2 = await BlockStore.create(db_wrapper_2)
+        store_2 = await BlockStore.create(db_wrapper_2, test_constants)
         hint_store = await HintStore.create(db_wrapper_2)
         bc = await Blockchain.create(coin_store_2, store_2, test_constants, hint_store, tmp_dir)
 
-        store = await BlockStore.create(db_wrapper)
-        await BlockStore.create(db_wrapper_2)
+        store = await BlockStore.create(db_wrapper, test_constants)
+        await BlockStore.create(db_wrapper_2, test_constants)
         try:
             # Save/get block
             for block in blocks:
@@ -106,9 +106,9 @@ class TestBlockStore:
         wrapper = DBWrapper(connection, False, db_version)
         wrapper_2 = DBWrapper(connection_2, False, db_version)
 
-        store = await BlockStore.create(wrapper)
+        store = await BlockStore.create(wrapper, test_constants)
         coin_store_2 = await CoinStore.create(wrapper_2)
-        store_2 = await BlockStore.create(wrapper_2)
+        store_2 = await BlockStore.create(wrapper_2, test_constants)
         hint_store = await HintStore.create(wrapper_2)
         bc = await Blockchain.create(coin_store_2, store_2, test_constants, hint_store, tmp_dir)
         block_records = []

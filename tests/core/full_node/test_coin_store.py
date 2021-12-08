@@ -251,7 +251,7 @@ class TestCoinStoreWithBlocks:
             reorg_length = 15
             blocks = bt.get_consecutive_blocks(initial_block_count)
             coin_store = await CoinStore.create(db_wrapper, cache_size=uint32(cache_size))
-            store = await BlockStore.create(db_wrapper)
+            store = await BlockStore.create(db_wrapper, test_constants)
             hint_store = await HintStore.create(db_wrapper)
             b: Blockchain = await Blockchain.create(coin_store, store, test_constants, hint_store, tmp_dir)
             try:
@@ -322,7 +322,7 @@ class TestCoinStoreWithBlocks:
                 guarantee_transaction_block=True,
             )
             coin_store = await CoinStore.create(db_wrapper, cache_size=uint32(cache_size))
-            store = await BlockStore.create(db_wrapper)
+            store = await BlockStore.create(db_wrapper, test_constants)
             hint_store = await HintStore.create(db_wrapper)
             b: Blockchain = await Blockchain.create(coin_store, store, test_constants, hint_store, tmp_dir)
             for block in blocks:

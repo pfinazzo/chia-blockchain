@@ -179,7 +179,7 @@ class FullNode:
         self.db_wrapper = DBWrapper(
             self.connection, self.config.get("allow_database_upgrades", False), db_version=db_version
         )
-        self.block_store = await BlockStore.create(self.db_wrapper)
+        self.block_store = await BlockStore.create(self.db_wrapper, self.constants)
         self.sync_store = await SyncStore.create()
         self.hint_store = await HintStore.create(self.db_wrapper)
         self.coin_store = await CoinStore.create(self.db_wrapper)

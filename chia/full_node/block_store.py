@@ -8,8 +8,13 @@ from chia.types.blockchain_format.sized_bytes import bytes32
 from chia.types.full_block import FullBlock
 from chia.types.weight_proof import SubEpochChallengeSegment, SubEpochSegments
 from chia.util.db_wrapper import DBWrapper
-from chia.util.ints import uint32
+from chia.util.ints import uint32, uint8, uint64
 from chia.util.lru_cache import LRUCache
+from chia.consensus.pot_iterations import is_overflow_block
+from chia.consensus.constants import ConsensusConstants
+from chia.types.blockchain_format.slots import ChallengeBlockInfo
+from chia.types.blockchain_format.sub_epoch_summary import SubEpochSummary
+from chia.types.blockchain_format.classgroup import ClassgroupElement
 import zstd
 
 log = logging.getLogger(__name__)
@@ -20,33 +25,35 @@ class BlockStore:
     block_cache: LRUCache
     db_wrapper: DBWrapper
     ses_challenge_cache: LRUCache
+    constants: ConsensusConstants
 
     @classmethod
-    async def create(cls, db_wrapper: DBWrapper):
+    async def create(cls, db_wrapper: DBWrapper, constants: ConsensusConstants):
         self = cls()
 
         # All full blocks which have been added to the blockchain. Header_hash -> block
         self.db_wrapper = db_wrapper
         self.db = db_wrapper.db
+        self.constants = constants
 
         if self.db_wrapper.db_version == 2:
 
+            # TODO: move some of these fields into the block blob. One reason we keep
+            # a copy prev_hash in thes table is because it's slow to parse the
+            # FullBlock. Once we've made that fast, we can move many of these
+            # fields into the blob, to save space
             await self.db.execute(
                 "CREATE TABLE IF NOT EXISTS full_blocks("
                 "header_hash blob PRIMARY KEY,"
-                "height bigint,"
-                "is_fully_compactified tinyint,"
-                "block blob)"
-            )
-
-            # Block records
-            await self.db.execute(
-                "CREATE TABLE IF NOT EXISTS block_records("
-                "header_hash blob PRIMARY KEY,"
                 "prev_hash blob,"
                 "height bigint,"
-                "block blob,"
-                "sub_epoch_summary blob)"
+                "sub_slot_iters blob,"
+                "required_iters blob,"
+                "deficit tinyint,"
+                "prev_transaction_height int,"
+                "sub_epoch_summary blob,"
+                "is_fully_compactified tinyint,"
+                "block blob)"
             )
 
             # This is a single-row table containing the hash of the current
@@ -61,11 +68,10 @@ class BlockStore:
             )
 
             # Height index so we can look up in order of height for sync purposes
-            await self.db.execute("CREATE INDEX IF NOT EXISTS full_block_height on full_blocks(height)")
+            await self.db.execute("CREATE INDEX IF NOT EXISTS height on full_blocks(height)")
             await self.db.execute(
                 "CREATE INDEX IF NOT EXISTS is_fully_compactified on full_blocks(is_fully_compactified)"
             )
-            await self.db.execute("CREATE INDEX IF NOT EXISTS height on block_records(height)")
 
         else:
 
@@ -135,30 +141,30 @@ class BlockStore:
         self.block_cache.put(header_hash, block)
 
         if self.db_wrapper.db_version == 2:
+
+            ses: Optional[bytes] = (
+                None
+                if block_record.sub_epoch_summary_included is None
+                else bytes(block_record.sub_epoch_summary_included)
+            )
+
             cursor_1 = await self.db.execute(
-                "INSERT OR REPLACE INTO full_blocks VALUES(?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO full_blocks VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     header_hash,
+                    block.prev_header_hash,
                     block.height,
+                    bytes(block_record.sub_slot_iters),
+                    bytes(block_record.required_iters),
+                    block_record.deficit,
+                    block_record.prev_transaction_block_height,
+                    ses,
                     int(block.is_fully_compactified()),
                     self.compress(block),
                 ),
             )
             await cursor_1.close()
 
-            cursor_2 = await self.db.execute(
-                "INSERT OR REPLACE INTO block_records VALUES(?, ?, ?, ?, ?)",
-                (
-                    header_hash,
-                    block.prev_header_hash,
-                    block.height,
-                    bytes(block_record),
-                    None
-                    if block_record.sub_epoch_summary_included is None
-                    else bytes(block_record.sub_epoch_summary_included),
-                ),
-            )
-            await cursor_2.close()
         else:
             cursor_1 = await self.db.execute(
                 "INSERT OR REPLACE INTO full_blocks VALUES(?, ?, ?, ?, ?)",
@@ -282,19 +288,32 @@ class BlockStore:
         if len(header_hashes) == 0:
             return []
 
-        header_hashes_db: Tuple[Any, ...]
-        if self.db_wrapper.db_version == 2:
-            header_hashes_db = tuple(header_hashes)
-        else:
-            header_hashes_db = tuple([hh.hex() for hh in header_hashes])
-        formatted_str = f'SELECT block from block_records WHERE header_hash in ({"?," * (len(header_hashes_db) - 1)}?)'
-        cursor = await self.db.execute(formatted_str, header_hashes_db)
-        rows = await cursor.fetchall()
-        await cursor.close()
         all_blocks: Dict[bytes32, BlockRecord] = {}
-        for row in rows:
-            block_rec: BlockRecord = BlockRecord.from_bytes(row[0])
-            all_blocks[block_rec.header_hash] = block_rec
+        if self.db_wrapper.db_version == 2:
+            cursor = await self.db.execute(
+                "SELECT block,"
+                "sub_slot_iters,"
+                "required_iters,"
+                "deficit,"
+                "prev_transaction_height,"
+                "sub_epoch_summary,"
+                f'header_hash FROM full_blocks WHERE header_hash in ({"?," * (len(header_hashes) - 1)}?)',
+                tuple(header_hashes),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+            for row in rows:
+                header_hash = bytes32(row[6])
+                all_blocks[header_hash] = self.make_block_record(row)
+        else:
+            formatted_str = f'SELECT block from block_records WHERE header_hash in ({"?," * (len(header_hashes) - 1)}?)'
+            cursor = await self.db.execute(formatted_str, tuple([hh.hex() for hh in header_hashes]))
+            rows = await cursor.fetchall()
+            await cursor.close()
+            for row in rows:
+                block_rec: BlockRecord = BlockRecord.from_bytes(row[0])
+                all_blocks[block_rec.header_hash] = block_rec
+
         ret: List[BlockRecord] = []
         for hh in header_hashes:
             if hh not in all_blocks:
@@ -338,14 +357,33 @@ class BlockStore:
         return ret
 
     async def get_block_record(self, header_hash: bytes32) -> Optional[BlockRecord]:
-        cursor = await self.db.execute(
-            "SELECT block from block_records WHERE header_hash=?",
-            (self.maybe_to_hex(header_hash),),
-        )
-        row = await cursor.fetchone()
-        await cursor.close()
-        if row is not None:
-            return BlockRecord.from_bytes(row[0])
+
+        if self.db_wrapper.db_version == 2:
+
+            cursor = await self.db.execute(
+                "SELECT block,"
+                "sub_slot_iters,"
+                "required_iters,"
+                "deficit,"
+                "prev_transaction_height,"
+                "sub_epoch_summary,"
+                "header_hash FROM full_blocks WHERE header_hash=?",
+                (header_hash,),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            if row is not None:
+                return self.make_block_record(row)
+
+        else:
+            cursor = await self.db.execute(
+                "SELECT block from block_records WHERE header_hash=?",
+                (header_hash.hex(),),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            if row is not None:
+                return BlockRecord.from_bytes(row[0])
         return None
 
     async def get_block_records_in_range(
@@ -358,17 +396,38 @@ class BlockStore:
         if present.
         """
 
-        formatted_str = f"SELECT header_hash, block from block_records WHERE height >= {start} and height <= {stop}"
-
-        cursor = await self.db.execute(formatted_str)
-        rows = await cursor.fetchall()
-        await cursor.close()
         ret: Dict[bytes32, BlockRecord] = {}
-        for row in rows:
-            # TODO: address hint error and remove ignore
-            #       error: Invalid index type "bytes" for "Dict[bytes32, BlockRecord]"; expected type "bytes32"  [index]
-            header_hash = self.maybe_from_hex(row[0])
-            ret[header_hash] = BlockRecord.from_bytes(row[1])  # type: ignore[index]
+        if self.db_wrapper.db_version == 2:
+
+            cursor = await self.db.execute(
+                "SELECT block,"
+                "sub_slot_iters,"
+                "required_iters,"
+                "deficit,"
+                "prev_transaction_height,"
+                "sub_epoch_summary,"
+                "header_hash FROM full_blocks WHERE height >= ? AND height <= ?",
+                (start, stop),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+            for row in rows:
+                header_hash = bytes32(row[6])
+                ret[header_hash] = self.make_block_record(row)
+
+        else:
+
+            formatted_str = f"SELECT header_hash, block from block_records WHERE height >= {start} and height <= {stop}"
+
+            cursor = await self.db.execute(formatted_str)
+            rows = await cursor.fetchall()
+            await cursor.close()
+            for row in rows:
+                # TODO: address hint error and remove ignore
+                #       error: Invalid index type "bytes" for "Dict[bytes32, BlockRecord]";
+                # expected type "bytes32"  [index]
+                header_hash = bytes32(self.maybe_from_hex(row[0]))
+                ret[header_hash] = BlockRecord.from_bytes(row[1])  # type: ignore[index]
 
         return ret
 
@@ -406,14 +465,33 @@ class BlockStore:
         if peak is None:
             return {}, None
 
-        formatted_str = f"SELECT header_hash, block  from block_records WHERE height >= {peak[1] - blocks_n}"
-        cursor = await self.db.execute(formatted_str)
-        rows = await cursor.fetchall()
-        await cursor.close()
         ret: Dict[bytes32, BlockRecord] = {}
-        for row in rows:
-            header_hash = bytes32(self.maybe_from_hex(row[0]))
-            ret[header_hash] = BlockRecord.from_bytes(row[1])
+        if self.db_wrapper.db_version == 2:
+
+            cursor = await self.db.execute(
+                "SELECT block,"
+                "sub_slot_iters,"
+                "required_iters,"
+                "deficit,"
+                "prev_transaction_height,"
+                "sub_epoch_summary,"
+                "header_hash FROM full_blocks WHERE height >= ?",
+                (peak[1] - blocks_n,),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+            for row in rows:
+                header_hash = bytes32(row[6])
+                ret[header_hash] = self.make_block_record(row)
+
+        else:
+            formatted_str = f"SELECT header_hash, block  from block_records WHERE height >= {peak[1] - blocks_n}"
+            cursor = await self.db.execute(formatted_str)
+            rows = await cursor.fetchall()
+            await cursor.close()
+            for row in rows:
+                header_hash = bytes32(self.maybe_from_hex(row[0]))
+                ret[header_hash] = BlockRecord.from_bytes(row[1])
 
         return ret, peak[0]
 
@@ -460,3 +538,87 @@ class BlockStore:
             heights.append(int(row[0]))
 
         return heights
+
+    def make_block_record(self, row: Tuple[bytes, bytes, bytes, uint8, uint32, bytes, bytes32]) -> BlockRecord:
+
+        header_hash = row[6]
+        block = FullBlock.from_bytes(zstd.decompress(row[0]))
+
+        sub_slot_iters = uint64.from_bytes(row[1])
+        required_iters = uint64.from_bytes(row[2])
+        ses: SubEpochSummary = None if row[5] is None else SubEpochSummary.from_bytes(row[5])
+        deficit: uint8 = row[3]
+        prev_transaction_block_height: uint32 = row[4]
+
+        if block.reward_chain_block.infused_challenge_chain_ip_vdf is not None:
+            icc_output: Optional[ClassgroupElement] = block.reward_chain_block.infused_challenge_chain_ip_vdf.output
+        else:
+            icc_output = None
+
+        cbi = ChallengeBlockInfo(
+            block.reward_chain_block.proof_of_space,
+            block.reward_chain_block.challenge_chain_sp_vdf,
+            block.reward_chain_block.challenge_chain_sp_signature,
+            block.reward_chain_block.challenge_chain_ip_vdf,
+        )
+
+        overflow = is_overflow_block(self.constants, block.reward_chain_block.signage_point_index)
+
+        if len(block.finished_sub_slots) > 0:
+            finished_challenge_slot_hashes: Optional[List[bytes32]] = [
+                sub_slot.challenge_chain.get_hash() for sub_slot in block.finished_sub_slots
+            ]
+            finished_reward_slot_hashes: Optional[List[bytes32]] = [
+                sub_slot.reward_chain.get_hash() for sub_slot in block.finished_sub_slots
+            ]
+            finished_infused_challenge_slot_hashes: Optional[List[bytes32]] = [
+                sub_slot.infused_challenge_chain.get_hash()
+                for sub_slot in block.finished_sub_slots
+                if sub_slot.infused_challenge_chain is not None
+            ]
+        elif block.height == 0:
+            finished_challenge_slot_hashes = [self.constants.GENESIS_CHALLENGE]
+            finished_reward_slot_hashes = [self.constants.GENESIS_CHALLENGE]
+            finished_infused_challenge_slot_hashes = None
+        else:
+            finished_challenge_slot_hashes = None
+            finished_reward_slot_hashes = None
+            finished_infused_challenge_slot_hashes = None
+        prev_transaction_block_hash = (
+            block.foliage_transaction_block.prev_transaction_block_hash
+            if block.foliage_transaction_block is not None
+            else None
+        )
+        timestamp = block.foliage_transaction_block.timestamp if block.foliage_transaction_block is not None else None
+        fees = block.transactions_info.fees if block.transactions_info is not None else None
+        reward_claims_incorporated = (
+            block.transactions_info.reward_claims_incorporated if block.transactions_info is not None else None
+        )
+
+        return BlockRecord(
+            header_hash,
+            block.prev_header_hash,
+            block.height,
+            block.weight,
+            block.total_iters,
+            block.reward_chain_block.signage_point_index,
+            block.reward_chain_block.challenge_chain_ip_vdf.output,
+            icc_output,
+            block.reward_chain_block.get_hash(),
+            cbi.get_hash(),
+            sub_slot_iters,
+            block.foliage.foliage_block_data.pool_target.puzzle_hash,
+            block.foliage.foliage_block_data.farmer_reward_puzzle_hash,
+            required_iters,
+            deficit,
+            overflow,
+            prev_transaction_block_height,
+            timestamp,
+            prev_transaction_block_hash,
+            fees,
+            reward_claims_incorporated,
+            finished_challenge_slot_hashes,
+            finished_infused_challenge_slot_hashes,
+            finished_reward_slot_hashes,
+            ses,
+        )

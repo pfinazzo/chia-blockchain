@@ -19,6 +19,7 @@ from chia.types.blockchain_format.pool_target import PoolTarget
 from chia.types.blockchain_format.foliage import Foliage, FoliageTransactionBlock, TransactionsInfo, FoliageBlockData
 from chia.types.blockchain_format.program import SerializedProgram
 from chia.types.blockchain_format.sized_bytes import bytes32
+from chia.consensus.default_constants import DEFAULT_CONSTANTS
 
 
 NUM_ITERS = 20000
@@ -60,7 +61,7 @@ async def run_add_block_benchmark(version: int):
     prev_block = bytes32([0] * 32)
 
     try:
-        block_store = await BlockStore.create(db_wrapper)
+        block_store = await BlockStore.create(db_wrapper, DEFAULT_CONSTANTS)
 
         block_height = 1
         timestamp = uint64(1631794488)
